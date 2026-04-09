@@ -1,0 +1,36 @@
+# Core server
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+pyyaml
+httpx
+python-multipart
+
+# Model runtimes
+torch
+transformers
+accelerate
+huggingface-hub
+numpy
+pillow
+sentence-transformers
+einops
+
+# GGUF / llama.cpp
+llama-cpp-python
+
+# ASR
+nemo_toolkit[asr]
+# Alternative ASR (AMD/CPU friendly):
+# faster-whisper
+
+# Speaker diarization
+pyannote.audio
+
+# Optional extras — install on demand depending on the features you need:
+#   peft                                       # LoRA adapter support
+#   bitsandbytes                               # int8 / int4 quantization (NVIDIA only)
+#   diffusers                                  # image generation (SDXL, Flux)
+#   opentelemetry-sdk                          # tracing
+#   opentelemetry-exporter-otlp-proto-http    # OTLP exporter

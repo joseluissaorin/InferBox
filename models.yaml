@@ -1,0 +1,58 @@
+models:
+  qwen3-vl-embed:
+    type: embedding
+    loader: hf_embed
+    model_id: "Qwen/Qwen3-VL-Embedding-2B"
+    dtype: float16
+    trust_remote_code: true
+    vram_mb: 4500
+    default_for: embedding
+    options:
+      embedding_dim: 2048
+      multimodal: true
+
+  bge-reranker:
+    type: reranker
+    loader: hf_reranker
+    model_id: "BAAI/bge-reranker-v2-m3"
+    dtype: float16
+    trust_remote_code: false
+    vram_mb: 600
+    default_for: reranker
+
+  glm-ocr:
+    type: generate
+    loader: hf_causal
+    model_id: "zai-org/GLM-OCR"
+    dtype: float16
+    trust_remote_code: true
+    vram_mb: 2000
+
+  qwen3-0.6b:
+    type: generate
+    loader: gguf
+    model_id: "Qwen/Qwen3-0.6B-GGUF"
+    model_file: "Qwen3-0.6B-Q8_0.gguf"
+    vram_mb: 800
+    default_for: generate
+    options:
+      n_gpu_layers: -1
+      n_ctx: 8192
+
+  parakeet-tdt:
+    type: transcription
+    loader: nemo_asr
+    model_id: "nvidia/parakeet-tdt-0.6b-v3"
+    vram_mb: 1500
+    default_for: transcription
+
+  sdxl-turbo:
+    type: image_gen
+    loader: diffusers_img
+    model_id: "stabilityai/sdxl-turbo"
+    dtype: float16
+    vram_mb: 7000
+    default_for: image_gen
+    options:
+      default_steps: 1
+      default_guidance: 0.0

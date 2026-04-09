@@ -1,0 +1,18 @@
+[Unit]
+Description=InferBox GPU Inference Server
+After=network.target
+
+[Service]
+# Edit these paths + user for your install location
+User=YOUR_USER
+WorkingDirectory=/opt/inferbox
+ExecStart=/opt/inferbox/.venv/bin/uvicorn inferbox.server:app --host 0.0.0.0 --port 8811
+EnvironmentFile=/opt/inferbox/.env
+Restart=always
+RestartSec=5
+
+# Let drain finish cleanly on stop
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

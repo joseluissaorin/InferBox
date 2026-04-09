@@ -1,0 +1,38 @@
+services:
+  inferbox:
+    build: .
+    image: inferbox:latest
+    container_name: inferbox
+    restart: unless-stopped
+    ports:
+      - "8811:8811"
+    environment:
+      INFERBOX_HOST: "0.0.0.0"
+      INFERBOX_PORT: "8811"
+      INFERBOX_API_KEY: "${INFERBOX_API_KEY:-change-me}"
+      INFERBOX_PRELOAD: "${INFERBOX_PRELOAD:-}"
+      INFERBOX_TOTAL_VRAM_MB: "${INFERBOX_TOTAL_VRAM_MB:-12000}"
+      INFERBOX_IDLE_TIMEOUT: "${INFERBOX_IDLE_TIMEOUT:-300}"
+      INFERBOX_AUDIT_LOG: "/data/audit.jsonl"
+      HF_HOME: "/root/.cache/huggingface"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - inferbox-data:/data
+      - ./models.yaml:/app/models.yaml:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8811/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  hf-cache:
+  inferbox-data:
