@@ -29,8 +29,10 @@ def load(config: ModelConfig) -> RerankerModel:
 
 
 def unload(model: RerankerModel):
-    del model.model
-    torch.cuda.empty_cache()
+    # Do NOT `del model.model` — racey with live inference.
+    # See hf_embed.unload for details.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def rerank(

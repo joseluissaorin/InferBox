@@ -33,6 +33,20 @@ class LoadedModel:
     loader_module: Any
     device: str
     last_used: float = field(default_factory=time.time)
+    # Number of currently-running requests holding a reference to this
+    # model. The idle checker and eviction logic MUST NOT unload a model
+    # with in_flight > 0 — doing so races against live inference and
+    # causes AttributeError crashes in loaders that mutate the object.
+    in_flight: int = 0
+    # Per-model inference lock. Most underlying model objects — notably
+    # llama-cpp-python's `Llama` and HF `AutoModelForCausalLM` — are NOT
+    # safe to call concurrently from multiple threads: the KV cache /
+    # generation state is shared mutable state and concurrent access
+    # causes IndexError, SIGSEGV, or silent garbage output. InferBox's
+    # generate route uses `asyncio.to_thread`, so two in-flight requests
+    # land on two thread-pool threads hitting the same Llama. The lock
+    # serialises them. Embed is fine to parallelise at the batch layer.
+    inference_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class ModelManager:
@@ -130,6 +144,14 @@ class ModelManager:
         return best_device
 
     async def get(self, model_id: str) -> LoadedModel:
+        """Fetch a loaded model, loading it on demand.
+
+        WARNING: using the returned entry directly is UNSAFE — if inference
+        takes longer than `idle_timeout` seconds, the idle checker can
+        evict the model out from under you. Prefer the `use()` async
+        context manager, which increments an in-flight counter to block
+        eviction while you hold the reference.
+        """
         async with self._lock:
             if model_id in self.loaded:
                 self.loaded[model_id].last_used = time.time()
@@ -160,6 +182,55 @@ class ModelManager:
             logger.info(f"Model {model_id} loaded on {device}. Device VRAM used: {self.used_vram(device)}MB")
             return self.loaded[model_id]
 
+    def use(self, model_id: str, serialize: bool = False):
+        """Async context manager: acquire a model for the duration of a request.
+
+        Increments the `in_flight` counter on entry and decrements on exit.
+        The idle checker and eviction logic skip any model with in_flight > 0,
+        guaranteeing the loaded object stays alive for as long as the caller
+        holds the reference — no matter how long inference takes.
+
+        If `serialize=True`, also acquires the model's per-model inference
+        lock, serialising concurrent callers. This is REQUIRED for loaders
+        whose underlying object is not thread-safe (GGUF/llama-cpp, HF
+        causal LMs with KV cache). Embed/rerank loaders can leave it False.
+
+        Usage:
+            async with manager.use("qwen3-0.6b", serialize=True) as entry:
+                result = await asyncio.to_thread(
+                    entry.loader_module.generate, entry.obj, ...
+                )
+        """
+        mgr = self
+
+        class _Ctx:
+            def __init__(self):
+                self.entry: LoadedModel | None = None
+                self._lock_held = False
+
+            async def __aenter__(self):
+                self.entry = await mgr.get(model_id)
+                # Mark in-flight under the lock so eviction sees it immediately
+                async with mgr._lock:
+                    self.entry.in_flight += 1
+                    self.entry.last_used = time.time()
+                if serialize:
+                    await self.entry.inference_lock.acquire()
+                    self._lock_held = True
+                return self.entry
+
+            async def __aexit__(self, exc_type, exc, tb):
+                if self._lock_held and self.entry is not None:
+                    self.entry.inference_lock.release()
+                    self._lock_held = False
+                if self.entry is not None:
+                    async with mgr._lock:
+                        self.entry.in_flight = max(0, self.entry.in_flight - 1)
+                        self.entry.last_used = time.time()
+                return False
+
+        return _Ctx()
+
     async def load(self, model_id: str) -> None:
         await self.get(model_id)
 
@@ -179,9 +250,12 @@ class ModelManager:
         logger.info(f"Model {model_id} unloaded.")
 
     def _find_eviction_candidate(self) -> str | None:
+        """Pick the oldest idle model that is NOT currently serving a request."""
         oldest_name = None
         oldest_time = float("inf")
         for name, entry in self.loaded.items():
+            if entry.in_flight > 0:
+                continue  # Never evict an in-use model
             if entry.last_used < oldest_time:
                 oldest_time = entry.last_used
                 oldest_name = name
@@ -198,7 +272,8 @@ class ModelManager:
             async with self._lock:
                 to_unload = [
                     mid for mid, entry in self.loaded.items()
-                    if now - entry.last_used > self.idle_timeout
+                    if entry.in_flight == 0
+                    and now - entry.last_used > self.idle_timeout
                 ]
                 for mid in to_unload:
                     await self._unload(mid)

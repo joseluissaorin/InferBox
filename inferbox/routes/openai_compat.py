@@ -82,11 +82,6 @@ async def chat_completions(req: ChatCompletionRequest):
         except KeyError:
             raise HTTPException(404, f"Model not found: {req.model}")
 
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
-
     messages_dict = [m.model_dump(exclude_none=True) for m in req.messages]
     stop = [req.stop] if isinstance(req.stop, str) else req.stop
     max_tokens = req.max_tokens or 512
@@ -102,7 +97,6 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         async def event_stream():
             t0 = time.time()
-            stream_fn = getattr(entry.loader_module, "generate_stream", None)
             cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 
@@ -115,62 +109,72 @@ async def chat_completions(req: ChatCompletionRequest):
             yield f"data: {json.dumps(first)}\n\n"
 
             try:
-                if stream_fn is None:
-                    result = await asyncio.to_thread(
-                        entry.loader_module.generate,
-                        entry.obj, entry.config,
-                        prompt=None, messages=messages_dict,
-                        max_tokens=max_tokens, temperature=req.temperature,
-                        stop=stop,
-                    )
-                    chunk = {
+                try:
+                    ctx = mgr.use(model_id, serialize=True)
+                    entry = await ctx.__aenter__()
+                except RuntimeError as e:
+                    err = {"error": {"message": str(e), "type": "server_error"}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    return
+                try:
+                    stream_fn = getattr(entry.loader_module, "generate_stream", None)
+                    if stream_fn is None:
+                        result = await asyncio.to_thread(
+                            entry.loader_module.generate,
+                            entry.obj, entry.config,
+                            prompt=None, messages=messages_dict,
+                            max_tokens=max_tokens, temperature=req.temperature,
+                            stop=stop,
+                        )
+                        chunk = {
+                            "id": cmpl_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_id,
+                            "choices": [{"index": 0, "delta": {"content": result["text"]}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    else:
+                        queue: asyncio.Queue = asyncio.Queue()
+                        loop = asyncio.get_event_loop()
+
+                        def producer():
+                            try:
+                                for token in stream_fn(
+                                    entry.obj, entry.config,
+                                    prompt=None, messages=messages_dict,
+                                    max_tokens=max_tokens, temperature=req.temperature,
+                                    stop=stop,
+                                ):
+                                    asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
+                                asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop)
+                            except Exception as e:
+                                asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
+
+                        asyncio.get_event_loop().run_in_executor(None, producer)
+
+                        while True:
+                            kind, payload = await queue.get()
+                            if kind == "token":
+                                chunk = {
+                                    "id": cmpl_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": model_id,
+                                    "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            elif kind == "done":
+                                break
+                            elif kind == "error":
+                                raise RuntimeError(payload)
+
+                    final = {
                         "id": cmpl_id, "object": "chat.completion.chunk",
                         "created": created, "model": model_id,
-                        "choices": [{"index": 0, "delta": {"content": result["text"]}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                else:
-                    queue: asyncio.Queue = asyncio.Queue()
-                    loop = asyncio.get_event_loop()
-
-                    def producer():
-                        try:
-                            for token in stream_fn(
-                                entry.obj, entry.config,
-                                prompt=None, messages=messages_dict,
-                                max_tokens=max_tokens, temperature=req.temperature,
-                                stop=stop,
-                            ):
-                                asyncio.run_coroutine_threadsafe(queue.put(("token", token)), loop)
-                            asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop)
-                        except Exception as e:
-                            asyncio.run_coroutine_threadsafe(queue.put(("error", str(e))), loop)
-
-                    asyncio.get_event_loop().run_in_executor(None, producer)
-
-                    while True:
-                        kind, payload = await queue.get()
-                        if kind == "token":
-                            chunk = {
-                                "id": cmpl_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model_id,
-                                "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}],
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                        elif kind == "done":
-                            break
-                        elif kind == "error":
-                            raise RuntimeError(payload)
-
-                # Final chunk
-                final = {
-                    "id": cmpl_id, "object": "chat.completion.chunk",
-                    "created": created, "model": model_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-                yield f"data: {json.dumps(final)}\n\n"
-                yield "data: [DONE]\n\n"
-                record_request(model_id, "chat.completions", time.time() - t0, success=True)
+                    yield f"data: {json.dumps(final)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    record_request(model_id, "chat.completions", time.time() - t0, success=True)
+                finally:
+                    await ctx.__aexit__(None, None, None)
             except Exception as e:
                 record_request(model_id, "chat.completions", time.time() - t0, success=False)
                 err = {"error": {"message": str(e), "type": "server_error"}}
@@ -181,13 +185,24 @@ async def chat_completions(req: ChatCompletionRequest):
     # Non-streaming
     t0 = time.time()
     try:
-        result = await asyncio.to_thread(
-            entry.loader_module.generate,
-            entry.obj, entry.config,
-            prompt=None, messages=messages_dict,
-            max_tokens=max_tokens, temperature=req.temperature,
-            stop=stop, grammar=grammar,
-        )
+        async with mgr.use(model_id, serialize=True) as entry:
+            try:
+                result = await asyncio.to_thread(
+                    entry.loader_module.generate,
+                    entry.obj, entry.config,
+                    prompt=None, messages=messages_dict,
+                    max_tokens=max_tokens, temperature=req.temperature,
+                    stop=stop, grammar=grammar,
+                )
+            except TypeError:
+                # Loader doesn't accept grammar param - retry without
+                result = await asyncio.to_thread(
+                    entry.loader_module.generate,
+                    entry.obj, entry.config,
+                    prompt=None, messages=messages_dict,
+                    max_tokens=max_tokens, temperature=req.temperature,
+                    stop=stop,
+                )
         record_request(model_id, "chat.completions", time.time() - t0, success=True)
 
         usage_data = result.get("usage", {})
@@ -206,28 +221,9 @@ async def chat_completions(req: ChatCompletionRequest):
                 total_tokens=usage_data.get("prompt_tokens", 0) + usage_data.get("completion_tokens", 0),
             ),
         )
-    except TypeError:
-        # Loader doesn't accept grammar param - retry without
-        result = await asyncio.to_thread(
-            entry.loader_module.generate,
-            entry.obj, entry.config,
-            prompt=None, messages=messages_dict,
-            max_tokens=max_tokens, temperature=req.temperature,
-            stop=stop,
-        )
-        record_request(model_id, "chat.completions", time.time() - t0, success=True)
-        usage_data = result.get("usage", {})
-        return ChatCompletionResponse(
-            id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            created=int(time.time()),
-            model=model_id,
-            choices=[Choice(index=0, message={"role": "assistant", "content": result["text"]}, finish_reason="stop")],
-            usage=Usage(
-                prompt_tokens=usage_data.get("prompt_tokens", 0),
-                completion_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("prompt_tokens", 0) + usage_data.get("completion_tokens", 0),
-            ),
-        )
+    except RuntimeError as e:
+        record_request(model_id, "chat.completions", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception as e:
         record_request(model_id, "chat.completions", time.time() - t0, success=False)
         raise HTTPException(500, str(e))
@@ -268,21 +264,16 @@ async def embeddings(req: EmbeddingsRequest):
         except KeyError:
             raise HTTPException(404, f"Model not found: {req.model}")
 
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
-
     inputs = [req.input] if isinstance(req.input, str) else req.input
 
     t0 = time.time()
     try:
-        result = await asyncio.to_thread(
-            entry.loader_module.embed,
-            entry.obj, entry.config, inputs,
-        )
+        async with mgr.use(model_id, serialize=False) as entry:
+            result = await asyncio.to_thread(
+                entry.loader_module.embed,
+                entry.obj, entry.config, inputs,
+            )
         record_request(model_id, "embeddings", time.time() - t0, success=True, items=len(inputs))
-        # Truncate dimensions if requested (Matryoshka)
         if req.dimensions:
             result = [v[:req.dimensions] for v in result]
         return EmbeddingsResponse(
@@ -290,6 +281,9 @@ async def embeddings(req: EmbeddingsRequest):
             model=model_id,
             usage=Usage(prompt_tokens=sum(len(t.split()) for t in inputs), total_tokens=sum(len(t.split()) for t in inputs)),
         )
+    except RuntimeError as e:
+        record_request(model_id, "embeddings", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception as e:
         record_request(model_id, "embeddings", time.time() - t0, success=False)
         raise HTTPException(500, str(e))

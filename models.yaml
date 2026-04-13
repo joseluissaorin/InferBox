@@ -22,7 +22,7 @@ models:
 
   glm-ocr:
     type: generate
-    loader: hf_causal
+    loader: hf_vision_ocr
     model_id: "zai-org/GLM-OCR"
     dtype: float16
     trust_remote_code: true

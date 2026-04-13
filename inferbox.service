@@ -6,6 +6,13 @@ After=network.target
 # Edit these paths + user for your install location
 User=YOUR_USER
 WorkingDirectory=/opt/inferbox
+# llama-cpp-python's CUDA wheel ships libggml-cuda.so linked against
+# libcudart.so.12 and libcublas.so.12, but those aren't installed
+# system-wide on most boxes. PyTorch's `nvidia-*` pip packages bundle
+# them under the venv. Point LD_LIBRARY_PATH at those directories so
+# the dlopen at load time succeeds — without this the loader silently
+# falls back to the CPU backend and `n_gpu_layers=-1` becomes a no-op.
+Environment="LD_LIBRARY_PATH=/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cublas/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cufft/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/curand/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cusolver/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/cusparse/lib:/opt/inferbox/.venv/lib/python3.12/site-packages/nvidia/nvjitlink/lib"
 ExecStart=/opt/inferbox/.venv/bin/uvicorn inferbox.server:app --host 0.0.0.0 --port 8811
 EnvironmentFile=/opt/inferbox/.env
 Restart=always

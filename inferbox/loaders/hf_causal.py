@@ -45,11 +45,12 @@ def load(config: ModelConfig) -> HFCausalModel:
 
 
 def unload(model: HFCausalModel):
-    del model.model
-    del model.tokenizer
-    if model.processor:
-        del model.processor
-    torch.cuda.empty_cache()
+    # Do NOT `del model.XXX`. See hf_embed.unload for the race explanation:
+    # deleting attributes on a live object crashes any in-flight request
+    # that's holding a reference. Let GC reclaim after the manager drops
+    # its own reference.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def generate(

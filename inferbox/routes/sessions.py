@@ -149,25 +149,20 @@ async def session_turn(sid: str, req: SessionTurnRequest):
 
     mgr = get_manager()
     model_id = sess["model"]
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
 
-    # Append user message
     store.append(sid, "user", req.content)
-    sess = store.get(sid)  # refresh
+    sess = store.get(sid)
 
     t0 = time.time()
     try:
-        result = await asyncio.to_thread(
-            entry.loader_module.generate,
-            entry.obj, entry.config,
-            prompt=None, messages=sess["messages"],
-            max_tokens=req.max_tokens, temperature=req.temperature,
-            stop=req.stop,
-        )
-        # Append assistant response
+        async with mgr.use(model_id, serialize=True) as entry:
+            result = await asyncio.to_thread(
+                entry.loader_module.generate,
+                entry.obj, entry.config,
+                prompt=None, messages=sess["messages"],
+                max_tokens=req.max_tokens, temperature=req.temperature,
+                stop=req.stop,
+            )
         store.append(sid, "assistant", result["text"])
         record_request(model_id, "session.turn", time.time() - t0, success=True)
         return {
@@ -176,6 +171,9 @@ async def session_turn(sid: str, req: SessionTurnRequest):
             "response": result["text"],
             "turns": store.get(sid)["turn_count"],
         }
+    except RuntimeError as e:
+        record_request(model_id, "session.turn", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception as e:
         record_request(model_id, "session.turn", time.time() - t0, success=False)
         raise HTTPException(500, str(e))

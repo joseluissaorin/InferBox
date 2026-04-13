@@ -66,7 +66,7 @@ ws     ::= [ \t\n]*
 
 
 def load(config: ModelConfig) -> GGUFModel:
-    from llama_cpp import Llama, LlamaRAMCache
+    from llama_cpp import Llama
     from huggingface_hub import hf_hub_download
 
     model_path = hf_hub_download(
@@ -119,20 +119,19 @@ def load(config: ModelConfig) -> GGUFModel:
 
     llm = Llama(**llm_kwargs)
 
-    # Enable RAM cache for KV-cache prefix reuse
-    try:
-        llm.set_cache(LlamaRAMCache(capacity_bytes=cache_size))
-        logger.info(f"GGUF model loaded with KV cache ({cache_size // 1024 // 1024}MB)")
-    except Exception as e:
-        logger.warning(f"Could not enable LlamaRAMCache: {e}")
+    # NOTE: LlamaRAMCache (prefix KV reuse) is DISABLED. It causes
+    # `IndexError: index N is out of bounds for axis 0 with size M` inside
+    # llama.py:generate() when cache state drifts from n_tokens on varied
+    # prompts, and subsequently SIGSEGVs the C++ side. Our RAG prompts are
+    # mostly unique per call anyway, so prefix reuse is ~0% hit rate.
+    logger.info("GGUF model loaded (no prefix KV cache)")
 
     return GGUFModel(llm=llm, draft_llm=draft_llm)
 
 
 def unload(model: GGUFModel):
-    if model.draft_llm is not None:
-        del model.draft_llm
-    del model.llm
+    # Do NOT `del model.llm` or `del model.draft_llm`. See hf_embed.unload.
+    # GC will reclaim the Llama objects once the manager drops its reference.
     try:
         import torch
         torch.cuda.empty_cache()

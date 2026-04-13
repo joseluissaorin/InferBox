@@ -1,36 +1,23 @@
-# Core server
+# llama-cpp-python CUDA wheels. Without this index the default PyPI wheel
+# is CPU-only — libggml-cuda.so won't exist and n_gpu_layers=-1 becomes
+# a silent no-op. The runtime CUDA libs (libcudart.so.12, libcublas.so.12)
+# come from torch's bundled nvidia-* packages; wire LD_LIBRARY_PATH to
+# .venv/lib/.../nvidia/*/lib in the systemd unit (see inferbox.service).
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+
 fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
 pyyaml
-httpx
-python-multipart
-
-# Model runtimes
 torch
-transformers
+# transformers 5.x is required for glm-ocr (AutoModelForImageTextToText +
+# GlmOcrForConditionalGeneration). nemo-toolkit does NOT pin transformers,
+# but a transitive dep (huggingface-hub) can drag it down — pin explicitly.
+transformers>=5.5.4
 accelerate
-huggingface-hub
+huggingface-hub>=1.10
 numpy
-pillow
-sentence-transformers
-einops
-
-# GGUF / llama.cpp
-llama-cpp-python
-
-# ASR
+llama-cpp-python==0.3.20
 nemo_toolkit[asr]
-# Alternative ASR (AMD/CPU friendly):
-# faster-whisper
-
-# Speaker diarization
 pyannote.audio
-
-# Optional extras — install on demand depending on the features you need:
-#   peft                                       # LoRA adapter support
-#   bitsandbytes                               # int8 / int4 quantization (NVIDIA only)
-#   diffusers                                  # image generation (SDXL, Flux)
-#   opentelemetry-sdk                          # tracing
-#   opentelemetry-exporter-otlp-proto-http    # OTLP exporter

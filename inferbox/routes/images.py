@@ -42,31 +42,31 @@ async def generate_images(req: ImageGenRequest):
     except KeyError as e:
         raise HTTPException(400, str(e))
 
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
-
     t0 = time.time()
     try:
-        images_b64 = await asyncio.to_thread(
-            entry.loader_module.generate_image,
-            entry.obj, entry.config,
-            prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            width=req.width,
-            height=req.height,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            n=req.n,
-        )
+        # Diffusers pipelines share scheduler state; serialize.
+        async with mgr.use(model_id, serialize=True) as entry:
+            images_b64 = await asyncio.to_thread(
+                entry.loader_module.generate_image,
+                entry.obj, entry.config,
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt,
+                width=req.width,
+                height=req.height,
+                num_inference_steps=req.num_inference_steps,
+                guidance_scale=req.guidance_scale,
+                seed=req.seed,
+                n=req.n,
+            )
         record_request(model_id, "images.generations", time.time() - t0, success=True, items=req.n)
         return ImageGenResponse(
             created=int(time.time()),
             model=model_id,
             data=[ImageData(b64_json=b) for b in images_b64],
         )
+    except RuntimeError as e:
+        record_request(model_id, "images.generations", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception:
         record_request(model_id, "images.generations", time.time() - t0, success=False)
         raise

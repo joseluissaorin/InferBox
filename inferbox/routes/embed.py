@@ -76,42 +76,44 @@ async def embed(req: EmbedRequest):
         model_id = mgr.resolve_model(req.model, "embedding")
     except KeyError as e:
         raise HTTPException(400, str(e))
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
 
     t0 = time.time()
     try:
-        # Decide path: micro-batched if enabled and no instruction (instruction
-        # would change the prompt prefix and break coalescing)
-        use_batcher = (
-            settings.enable_micro_batching
-            and req.batched
-            and not req.instruction
-            and not req.images
-        )
-
-        if use_batcher:
-            runner = await _make_runner(model_id, entry)
-            batcher = await batcher_registry.get_or_create(model_id, "embed", runner)
-            embeddings = await batcher.submit({
-                "texts": req.input,
-                "images": req.images,
-                "instruction": req.instruction,
-            })
-        else:
-            embeddings = await asyncio.to_thread(
-                entry.loader_module.embed,
-                entry.obj, entry.config,
-                req.input,
-                instruction=req.instruction,
-                images=req.images,
+        # use(serialize=False): hold an in-flight ref so the idle checker
+        # can't evict the model mid-request. Embedding forward passes do
+        # not share mutable state, so concurrent calls on the same model
+        # object are fine.
+        async with mgr.use(model_id, serialize=False) as entry:
+            use_batcher = (
+                settings.enable_micro_batching
+                and req.batched
+                and not req.instruction
+                and not req.images
             )
+
+            if use_batcher:
+                runner = await _make_runner(model_id, entry)
+                batcher = await batcher_registry.get_or_create(model_id, "embed", runner)
+                embeddings = await batcher.submit({
+                    "texts": req.input,
+                    "images": req.images,
+                    "instruction": req.instruction,
+                })
+            else:
+                embeddings = await asyncio.to_thread(
+                    entry.loader_module.embed,
+                    entry.obj, entry.config,
+                    req.input,
+                    instruction=req.instruction,
+                    images=req.images,
+                )
 
         record_request(model_id, "embed", time.time() - t0, success=True,
                        items=max(len(req.input), len(req.images or [])))
         return EmbedResponse(model=model_id, embeddings=embeddings)
+    except RuntimeError as e:
+        record_request(model_id, "embed", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception:
         record_request(model_id, "embed", time.time() - t0, success=False)
         raise

@@ -59,7 +59,7 @@ def load(config: ModelConfig) -> DiffusersModel:
 
 
 def unload(model: DiffusersModel):
-    del model.pipe
+    # Do NOT `del model.pipe` — race with live inference. See hf_embed.
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

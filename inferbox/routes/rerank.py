@@ -33,24 +33,24 @@ async def rerank(req: RerankRequest):
         model_id = mgr.resolve_model(req.model, "reranker")
     except KeyError as e:
         raise HTTPException(400, str(e))
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
 
     t0 = time.time()
     try:
-        results = await asyncio.to_thread(
-            entry.loader_module.rerank,
-            entry.obj,
-            entry.config,
-            req.query,
-            req.documents,
-            top_k=req.top_k,
-        )
+        async with mgr.use(model_id, serialize=False) as entry:
+            results = await asyncio.to_thread(
+                entry.loader_module.rerank,
+                entry.obj,
+                entry.config,
+                req.query,
+                req.documents,
+                top_k=req.top_k,
+            )
         record_request(model_id, "rerank", time.time() - t0, success=True,
                        items=len(req.documents))
         return RerankResponse(model=model_id, results=results)
+    except RuntimeError as e:
+        record_request(model_id, "rerank", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception:
         record_request(model_id, "rerank", time.time() - t0, success=False)
         raise

@@ -127,10 +127,13 @@ def load(config: ModelConfig) -> HFEmbedModel:
 
 
 def unload(model: HFEmbedModel):
-    del model.model
-    del model.tokenizer
-    if model.processor:
-        del model.processor
+    # NOTE: do NOT `del model.XXX`. Deleting attributes on a live object
+    # creates a use-after-free window: if any request is holding a reference
+    # to this HFEmbedModel and running inference when the idle-evictor fires,
+    # its next attribute access will raise AttributeError. Let Python's GC
+    # reclaim the underlying torch tensors once the manager drops its own
+    # reference in `_unload()`. `empty_cache()` just releases the VRAM torch
+    # is caching; it doesn't touch our object graph.
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

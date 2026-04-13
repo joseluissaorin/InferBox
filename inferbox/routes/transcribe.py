@@ -33,10 +33,6 @@ async def transcribe(
         model_id = mgr.resolve_model(model, "transcription")
     except KeyError as e:
         raise HTTPException(400, str(e))
-    try:
-        entry = await mgr.get(model_id)
-    except RuntimeError as e:
-        raise HTTPException(503, str(e))
 
     # Save upload to temp file
     suffix = f".{file.filename.split('.')[-1]}" if file.filename and "." in file.filename else ".wav"
@@ -47,15 +43,20 @@ async def transcribe(
 
     t0 = time.time()
     try:
-        result = await asyncio.to_thread(
-            entry.loader_module.transcribe,
-            entry.obj,
-            entry.config,
-            tmp_path,
-            language=language,
-        )
+        # NeMo ASR is not thread-safe on a single instance — serialize it.
+        async with mgr.use(model_id, serialize=True) as entry:
+            result = await asyncio.to_thread(
+                entry.loader_module.transcribe,
+                entry.obj,
+                entry.config,
+                tmp_path,
+                language=language,
+            )
         record_request(model_id, "transcribe", time.time() - t0, success=True)
         return TranscribeResponse(model=model_id, **result)
+    except RuntimeError as e:
+        record_request(model_id, "transcribe", time.time() - t0, success=False)
+        raise HTTPException(503, str(e))
     except Exception:
         record_request(model_id, "transcribe", time.time() - t0, success=False)
         raise
