@@ -200,6 +200,51 @@ class TestRepeatedUnloadDoesNotAccumulate:
         )
 
 
+class TestUnloadDoesNotInvalidateInFlightRef:
+    """Unload must not corrupt references held by in-flight requests.
+
+    Regression guard for a bug I shipped myself (commit 63c9920)
+    where ``_unload`` set ``entry.obj = None`` on the dataclass to
+    "help GC". That mutated the object other coroutines were still
+    reading, causing ``AttributeError: 'NoneType' object has no
+    attribute 'tokenizer'`` on embed/rerank calls that overlapped
+    an eviction.
+
+    The real contract: the ``use()`` context manager blocks eviction
+    while ``in_flight > 0``. Tests should verify that even if
+    something ELSE calls unload (explicit admin endpoint, etc.)
+    during an in-flight request, the dataclass attributes that the
+    request is reading stay valid. We simulate this by grabbing a
+    reference to ``entry.obj`` before unload and checking it's
+    still the same object after.
+    """
+
+    def test_entry_obj_survives_unload(self, manager):
+        """Evicting a model must not null out other holders'
+        references to its dataclass attributes."""
+        model_id = _pick_small_model(manager)
+        assert model_id not in manager.loaded
+
+        asyncio.run(manager.load(model_id))
+        entry = manager.loaded[model_id]
+        held_obj = entry.obj  # simulate an in-flight request
+        assert held_obj is not None
+
+        asyncio.run(manager.unload(model_id))
+
+        # Dataclass attributes must NOT have been mutated out from
+        # under the in-flight caller. The local ``held_obj`` is
+        # still a live Python reference; the original
+        # ``entry.obj`` attribute must still point at it.
+        assert entry.obj is held_obj, (
+            "unload mutated entry.obj = None on the dataclass, which "
+            "would crash any in-flight request reading entry.obj. "
+            "This is the bug class the `use()` context manager is "
+            "supposed to prevent; don't reintroduce it via defensive "
+            "reference-nulling."
+        )
+
+
 class TestPickDeviceRespectsRealVRAM:
     """``_pick_device`` must refuse to assign a device when the real
     allocator has no room, even if the configured-budget accounting

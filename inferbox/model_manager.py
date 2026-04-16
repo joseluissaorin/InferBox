@@ -287,17 +287,21 @@ class ModelManager:
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
-        # Explicitly drop the Python reference so the GC has no reason
-        # to keep the loader object alive, then run gc + empty_cache
-        # in a worker thread. Without this, the torch caching allocator
-        # holds onto a few GB of "reserved" VRAM after every unload —
-        # enough to OOM subsequent lazy loads even though the config
-        # book-keeping says there's room. Concrete repro: load
-        # qwen3-vl-embed + bge-reranker, unload everything else,
-        # observe torch.cuda.memory_reserved stays at ~11 GB, then
-        # try to load qwen3-0.6b and Llama() fails. See prod incident
-        # 2026-04-16.
-        entry.obj = None  # drop strong ref on the dataclass
+        # Drop our local strong ref and nudge the GC + torch
+        # caching allocator to actually release the VRAM. Without
+        # this, torch.cuda.memory_reserved stays elevated for GB
+        # after every unload and subsequent lazy loads OOM (prod
+        # incident 2026-04-16).
+        #
+        # Importantly: do NOT set ``entry.obj = None`` on the
+        # dataclass instance. Another in-flight request can be
+        # holding a reference to this LoadedModel (via
+        # mgr.use()) and will crash with ``AttributeError:
+        # 'NoneType' object has no attribute '...'`` on its next
+        # attribute access. We want the GC to collect the loader
+        # object only once the last reference is dropped —
+        # Python refcount takes care of it as soon as the last
+        # caller exits its ``use()`` context.
         del entry
 
         def _flush():
