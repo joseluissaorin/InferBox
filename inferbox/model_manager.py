@@ -128,11 +128,20 @@ class ModelManager:
         """Real free VRAM on ``device`` in MB, or None if the device
         isn't a CUDA device we can query.
 
-        ``used_vram`` only sums the configured ``vram_mb`` of loaded
-        models, but the torch caching allocator holds onto blocks even
-        after a loader is unloaded — that "ghost" reservation was
-        making _pick_device think 5 GB was free when only 1.5 GB
-        actually was, and the next ``Llama()`` load OOMed.
+        Uses ``torch.cuda.mem_get_info`` (NVML) for driver-level free
+        bytes across all processes on the GPU. That's the right signal
+        for BOTH failure modes:
+
+          1. THIS process has "ghost" torch-allocator reservations
+             from previously-unloaded models (the 2026-04-16 prod
+             incident — inside a single long-running uvicorn).
+          2. OTHER processes on the card are holding memory our
+             internal ``memory_reserved`` won't see (co-hosted GPU
+             workloads, GPU benchmarks, pytest runs).
+
+        The previous implementation used ``memory_reserved`` (this-
+        process only) which reported the wrong number when another
+        process was occupying the card.
         """
         if not device.startswith("cuda"):
             return None
@@ -141,10 +150,7 @@ class ModelManager:
             idx = int(device.split(":")[1]) if ":" in device else 0
             if not torch.cuda.is_available() or idx >= torch.cuda.device_count():
                 return None
-            props = torch.cuda.get_device_properties(idx)
-            reserved = torch.cuda.memory_reserved(idx)
-            total = props.total_memory
-            free_bytes = total - reserved
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(idx)
             return max(0, int(free_bytes / 1_048_576))
         except Exception:
             return None
