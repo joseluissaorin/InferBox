@@ -124,6 +124,31 @@ class ModelManager:
             })
         return result
 
+    def _real_free_vram_mb(self, device: str) -> int | None:
+        """Real free VRAM on ``device`` in MB, or None if the device
+        isn't a CUDA device we can query.
+
+        ``used_vram`` only sums the configured ``vram_mb`` of loaded
+        models, but the torch caching allocator holds onto blocks even
+        after a loader is unloaded — that "ghost" reservation was
+        making _pick_device think 5 GB was free when only 1.5 GB
+        actually was, and the next ``Llama()`` load OOMed.
+        """
+        if not device.startswith("cuda"):
+            return None
+        try:
+            import torch
+            idx = int(device.split(":")[1]) if ":" in device else 0
+            if not torch.cuda.is_available() or idx >= torch.cuda.device_count():
+                return None
+            props = torch.cuda.get_device_properties(idx)
+            reserved = torch.cuda.memory_reserved(idx)
+            total = props.total_memory
+            free_bytes = total - reserved
+            return max(0, int(free_bytes / 1_048_576))
+        except Exception:
+            return None
+
     def _pick_device(self, cfg: ModelConfig) -> str | None:
         """Pick the best device for a model.
         - If cfg.device is set, use it
@@ -131,13 +156,21 @@ class ModelManager:
         """
         if cfg.device:
             return cfg.device
-        # Find GPU with most free space
+        # Find GPU with most free space. We combine TWO signals:
+        #   1. Configured-budget free space (total - sum(config.vram_mb))
+        #   2. Real allocator free space (total - torch.cuda.memory_reserved)
+        # and require BOTH to have headroom. Without #2, ghost VRAM
+        # from previously-unloaded models makes the manager think
+        # there's room when there isn't, and the actual load OOMs.
         best_device = None
         best_free = -1
         for dev, total in self.devices.items():
             if dev == "cpu":
                 continue
-            free = total - self.used_vram(dev)
+            free_budget = total - self.used_vram(dev)
+            free_real = self._real_free_vram_mb(dev)
+            # Use the more conservative of the two
+            free = min(free_budget, free_real) if free_real is not None else free_budget
             if free >= cfg.vram_mb and free > best_free:
                 best_free = free
                 best_device = dev
@@ -247,6 +280,39 @@ class ModelManager:
             await asyncio.to_thread(entry.loader_module.unload, entry.obj)
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
+
+        # Explicitly drop the Python reference so the GC has no reason
+        # to keep the loader object alive, then run gc + empty_cache
+        # in a worker thread. Without this, the torch caching allocator
+        # holds onto a few GB of "reserved" VRAM after every unload —
+        # enough to OOM subsequent lazy loads even though the config
+        # book-keeping says there's room. Concrete repro: load
+        # qwen3-vl-embed + bge-reranker, unload everything else,
+        # observe torch.cuda.memory_reserved stays at ~11 GB, then
+        # try to load qwen3-0.6b and Llama() fails. See prod incident
+        # 2026-04-16.
+        entry.obj = None  # drop strong ref on the dataclass
+        del entry
+
+        def _flush():
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                # reset_peak_memory_stats is cheap and makes the next
+                # memory_reserved() read reflect current state rather
+                # than historic peak.
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
+
+        try:
+            await asyncio.to_thread(_flush)
+        except Exception as e:
+            logger.warning(f"Post-unload VRAM flush failed for {model_id}: {e}")
+
         logger.info(f"Model {model_id} unloaded.")
 
     def _find_eviction_candidate(self) -> str | None:
