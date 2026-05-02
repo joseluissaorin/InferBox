@@ -1,4 +1,6 @@
 import asyncio
+import os
+import subprocess
 import tempfile
 import time
 from pydantic import BaseModel
@@ -22,6 +24,22 @@ class TranscribeResponse(BaseModel):
     segments: list[Segment] = []
 
 
+def _normalize_audio(src_path: str, dst_path: str) -> None:
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-i", src_path,
+            "-ac", "1", "-ar", "16000", "-f", "wav",
+            dst_path,
+        ],
+        capture_output=True,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        msg = proc.stderr.decode("utf-8", errors="replace").strip()[:500] or "ffmpeg failed"
+        raise HTTPException(status_code=400, detail=f"audio decode failed: {msg}")
+
+
 @router.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe(
     file: UploadFile = File(...),
@@ -34,22 +52,22 @@ async def transcribe(
     except KeyError as e:
         raise HTTPException(400, str(e))
 
-    # Save upload to temp file
     suffix = f".{file.filename.split('.')[-1]}" if file.filename and "." in file.filename else ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
         tmp.write(content)
-        tmp_path = tmp.name
+        upload_path = tmp.name
 
+    norm_path = upload_path + ".16k.wav"
     t0 = time.time()
     try:
-        # NeMo ASR is not thread-safe on a single instance — serialize it.
+        await asyncio.to_thread(_normalize_audio, upload_path, norm_path)
         async with mgr.use(model_id, serialize=True) as entry:
             result = await asyncio.to_thread(
                 entry.loader_module.transcribe,
                 entry.obj,
                 entry.config,
-                tmp_path,
+                norm_path,
                 language=language,
             )
         record_request(model_id, "transcribe", time.time() - t0, success=True)
@@ -61,6 +79,9 @@ async def transcribe(
         record_request(model_id, "transcribe", time.time() - t0, success=False)
         raise
     finally:
-        import os
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        for p in (upload_path, norm_path):
+            if os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
