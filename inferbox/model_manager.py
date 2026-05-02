@@ -50,9 +50,10 @@ class LoadedModel:
 
 
 class ModelManager:
-    def __init__(self, registry: dict[str, ModelConfig], total_vram_mb: int, idle_timeout: int):
+    def __init__(self, registry: dict[str, ModelConfig], total_vram_mb: int, idle_timeout: int, pinned: set[str] | None = None):
         self.registry = registry
         self.idle_timeout = idle_timeout
+        self.pinned: set[str] = set(pinned or ())
         self.loaded: dict[str, LoadedModel] = {}
         self._lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
@@ -326,12 +327,17 @@ class ModelManager:
         logger.info(f"Model {model_id} unloaded.")
 
     def _find_eviction_candidate(self) -> str | None:
-        """Pick the oldest idle model that is NOT currently serving a request."""
+        """Pick the oldest idle model that is NOT currently serving a request
+        and NOT pinned (preload-pinned models are kept resident even under
+        VRAM pressure — callers will get a load failure instead).
+        """
         oldest_name = None
         oldest_time = float("inf")
         for name, entry in self.loaded.items():
             if entry.in_flight > 0:
                 continue  # Never evict an in-use model
+            if name in self.pinned:
+                continue  # Pinned models survive VRAM pressure
             if entry.last_used < oldest_time:
                 oldest_time = entry.last_used
                 oldest_name = name
@@ -349,6 +355,7 @@ class ModelManager:
                 to_unload = [
                     mid for mid, entry in self.loaded.items()
                     if entry.in_flight == 0
+                    and mid not in self.pinned
                     and now - entry.last_used > self.idle_timeout
                 ]
                 for mid in to_unload:

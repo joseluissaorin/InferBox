@@ -49,22 +49,21 @@ async def lifespan(app: FastAPI):
     global manager
     init_tracing()
     registry = load_model_registry(settings.models_config)
-    manager = ModelManager(registry, settings.total_vram_mb, settings.idle_timeout)
+    preload_ids = [m.strip() for m in settings.preload.split(",") if m.strip()] if settings.preload else []
+    manager = ModelManager(registry, settings.total_vram_mb, settings.idle_timeout, pinned=set(preload_ids))
     manager.start_idle_checker()
     logger.info(f"InferBox started. {len(registry)} models registered.")
 
-    if settings.preload:
-        preload_ids = [m.strip() for m in settings.preload.split(",") if m.strip()]
-        for model_id in preload_ids:
-            if model_id not in registry:
-                logger.warning(f"Preload: unknown model '{model_id}', skipping")
-                continue
-            try:
-                logger.info(f"Preloading {model_id}...")
-                await manager.load(model_id)
-                logger.info(f"Preloaded {model_id}")
-            except Exception as e:
-                logger.warning(f"Failed to preload {model_id}: {e}")
+    for model_id in preload_ids:
+        if model_id not in registry:
+            logger.warning(f"Preload: unknown model '{model_id}', skipping")
+            continue
+        try:
+            logger.info(f"Preloading {model_id}...")
+            await manager.load(model_id)
+            logger.info(f"Preloaded {model_id}")
+        except Exception as e:
+            logger.warning(f"Failed to preload {model_id}: {e}")
 
     yield
 
